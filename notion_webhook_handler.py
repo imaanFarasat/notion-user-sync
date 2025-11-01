@@ -22,17 +22,31 @@ USERS_DATABASE_ID = os.getenv("NOTION_USERS_DATABASE_ID", None)
 
 def is_user_page(event: Dict) -> bool:
     """Check if the event is for a user page in the Users database"""
+    # Notion webhook structure has two possible formats:
+    # 1. event.data.object.parent (for page.created/updated)
+    # 2. event.data.parent (for page.properties_updated)
+    
     event_data = event.get("data", {})
     
-    # Get the page object
-    page_obj = event_data.get("object", {})
-    if page_obj.get("object") != "page":
+    # Check if it's a page entity
+    entity = event.get("entity", {})
+    if entity.get("type") != "page":
         return False
     
-    # Check if it's in the Users database
-    parent = page_obj.get("parent", {})
-    if parent.get("type") == "database_id":
-        database_id = parent.get("database_id")
+    # Get parent database info
+    parent = event_data.get("parent", {})
+    if not parent:
+        # Try alternative structure (for page.created/updated)
+        page_obj = event_data.get("object", {})
+        parent = page_obj.get("parent", {})
+    
+    # Check parent type
+    if parent.get("type") == "database" or parent.get("type") == "database_id":
+        # Get database ID
+        database_id = parent.get("id") or parent.get("database_id")
+        
+        if not database_id:
+            return False
         
         # If we have the Users database ID, check if it matches
         if USERS_DATABASE_ID:
@@ -57,18 +71,38 @@ def handle_notion_webhook(event: Dict) -> Dict:
     event_type = event.get("type")
     print(f"   📋 Event type: {event_type}")
     
-    event_data = event.get("data", {})
-    
-    # Get the page object
-    page_obj = event_data.get("object", {})
-    print(f"   📄 Page object type: {page_obj.get('object')}")
-    
-    if event_type not in ["page.created", "page.updated"]:
+    # Support multiple event types
+    supported_types = ["page.created", "page.updated", "page.properties_updated"]
+    if event_type not in supported_types:
         print(f"   ⏭️  Ignoring event type: {event_type}")
         return {
             "status": "ignored",
             "message": f"Event type {event_type} not handled"
         }
+    
+    # Get page ID from entity or data.object
+    entity = event.get("entity", {})
+    event_data = event.get("data", {})
+    
+    # Extract page ID
+    if entity.get("type") == "page":
+        page_id = entity.get("id")
+        print(f"   📄 Page from entity: {page_id}")
+    else:
+        # Fallback to data.object structure
+        page_obj = event_data.get("object", {})
+        page_id = page_obj.get("id")
+        print(f"   📄 Page from data.object: {page_id}")
+    
+    # Get page ID first
+    if not page_id:
+        print(f"   ❌ No page ID found")
+        return {
+            "status": "error",
+            "message": "No page ID found in event"
+        }
+    
+    print(f"   🆔 Page ID: {page_id}")
     
     # Check if it's a user page
     is_user = is_user_page(event)
@@ -81,16 +115,6 @@ def handle_notion_webhook(event: Dict) -> Dict:
             "message": "Not a user page"
         }
     
-    # Get the page ID
-    page_id = page_obj.get("id")
-    if not page_id:
-        print(f"   ❌ No page ID found")
-        return {
-            "status": "error",
-            "message": "No page ID found in event"
-        }
-    
-    print(f"   🆔 Page ID: {page_id}")
     print(f"   🔄 Starting sync to HubSpot...")
     
     # Sync to HubSpot
