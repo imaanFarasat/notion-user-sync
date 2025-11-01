@@ -64,11 +64,39 @@ def normalize_user_name(first_name: str, last_name: str) -> tuple:
     return (normalized_first, normalized_last)
 
 
-def get_hubspot_user(user_id: str) -> Optional[Dict]:
-    """Get a user from HubSpot by user ID"""
+def get_hubspot_user(user_id: str, is_contact: bool = False) -> Optional[Dict]:
+    """
+    Get a user/contact from HubSpot by ID
+    
+    Args:
+        user_id: HubSpot user or contact ID
+        is_contact: If True, directly use Contacts API; if False, try Users API first
+    """
     if not HUBSPOT_ACCESS_TOKEN:
         print("  ✗ Error: HUBSPOT_ACCESS_TOKEN not set")
         return None
+    
+    # If we know it's a contact, go directly to Contacts API
+    if is_contact:
+        print(f"  📞 Fetching Contact {user_id} from Contacts API...")
+        contact_url = f"{HUBSPOT_BASE_URL}/crm/v3/objects/contacts/{user_id}"
+        contact_response = requests.get(contact_url, headers=HUBSPOT_HEADERS)
+        if contact_response.status_code == 200:
+            contact_data = contact_response.json()
+            # Convert contact format to user-like format
+            props = contact_data.get("properties", {})
+            return {
+                "id": contact_data.get("id"),
+                "firstName": props.get("firstname", ""),
+                "lastName": props.get("lastname", ""),
+                "firstname": props.get("firstname", ""),  # Keep lowercase too
+                "lastname": props.get("lastname", ""),      # Keep lowercase too
+                "email": props.get("email", "")
+            }
+        else:
+            print(f"  ✗ Error getting Contact: {contact_response.status_code}")
+            print(f"    Response: {contact_response.text}")
+            return None
     
     # Try Users API first (Settings API)
     url = f"{HUBSPOT_BASE_URL}/settings/v3/users/{user_id}"
@@ -89,6 +117,8 @@ def get_hubspot_user(user_id: str) -> Optional[Dict]:
                 "id": contact_data.get("id"),
                 "firstName": props.get("firstname", ""),
                 "lastName": props.get("lastname", ""),
+                "firstname": props.get("firstname", ""),
+                "lastname": props.get("lastname", ""),
                 "email": props.get("email", "")
             }
     
@@ -97,7 +127,7 @@ def get_hubspot_user(user_id: str) -> Optional[Dict]:
     return None
 
 
-def update_hubspot_user_name(user_id: str, first_name: str, last_name: str) -> bool:
+def update_hubspot_user_name(user_id: str, first_name: str, last_name: str, is_contact: bool = False) -> bool:
     """
     Update a user's first and last name in HubSpot
     Tries Users API first, falls back to Contacts API if needed
@@ -114,29 +144,8 @@ def update_hubspot_user_name(user_id: str, first_name: str, last_name: str) -> b
         print("  ✗ Error: HUBSPOT_ACCESS_TOKEN not set")
         return False
     
-    # Try Users API first (Settings API)
-    url = f"{HUBSPOT_BASE_URL}/settings/v3/users/{user_id}"
-    
-    payload = {}
-    if first_name:
-        payload["firstName"] = first_name
-    if last_name:
-        payload["lastName"] = last_name
-    
-    if not payload:
-        print("  ℹ️  No names to update")
-        return True
-    
-    # Try PATCH first, then PUT if needed
-    response = requests.patch(url, headers=HUBSPOT_HEADERS, json=payload)
-    
-    if response.status_code == 405:
-        # Try PUT method
-        response = requests.put(url, headers=HUBSPOT_HEADERS, json=payload)
-    
-    if response.status_code == 404:
-        # Not a User, try as Contact
-        print(f"  ⚠️  User {user_id} not found, trying as Contact...")
+    # If we know it's a contact, use Contacts API directly
+    if is_contact:
         contact_url = f"{HUBSPOT_BASE_URL}/crm/v3/objects/contacts/{user_id}"
         contact_payload = {
             "properties": {}
@@ -146,7 +155,45 @@ def update_hubspot_user_name(user_id: str, first_name: str, last_name: str) -> b
         if last_name:
             contact_payload["properties"]["lastname"] = last_name
         
+        if not contact_payload["properties"]:
+            print("  ℹ️  No names to update")
+            return True
+        
         response = requests.patch(contact_url, headers=HUBSPOT_HEADERS, json=contact_payload)
+    else:
+        # Try Users API first (Settings API)
+        url = f"{HUBSPOT_BASE_URL}/settings/v3/users/{user_id}"
+        
+        payload = {}
+        if first_name:
+            payload["firstName"] = first_name
+        if last_name:
+            payload["lastName"] = last_name
+        
+        if not payload:
+            print("  ℹ️  No names to update")
+            return True
+        
+        # Try PATCH first, then PUT if needed
+        response = requests.patch(url, headers=HUBSPOT_HEADERS, json=payload)
+        
+        if response.status_code == 405:
+            # Try PUT method
+            response = requests.put(url, headers=HUBSPOT_HEADERS, json=payload)
+        
+        if response.status_code == 404:
+            # Not a User, try as Contact
+            print(f"  ⚠️  User {user_id} not found, trying as Contact...")
+            contact_url = f"{HUBSPOT_BASE_URL}/crm/v3/objects/contacts/{user_id}"
+            contact_payload = {
+                "properties": {}
+            }
+            if first_name:
+                contact_payload["properties"]["firstname"] = first_name
+            if last_name:
+                contact_payload["properties"]["lastname"] = last_name
+            
+            response = requests.patch(contact_url, headers=HUBSPOT_HEADERS, json=contact_payload)
     
     if response.status_code == 200:
         print(f"  ✅ Updated name: {first_name} {last_name}")
@@ -195,7 +242,7 @@ def validate_expanded_object_payload(event: Dict) -> bool:
     return True  # Don't reject if format is slightly different, be flexible
 
 
-def handle_hubspot_user_webhook(event: Dict) -> Dict:
+def handle_hubspot_user_webhook(event) -> Dict:
     """
     Handle a webhook event from HubSpot
     Normalizes user names (capitalizes first letters)
@@ -212,13 +259,43 @@ def handle_hubspot_user_webhook(event: Dict) -> Dict:
     """
     print(f"   🔍 Processing HubSpot webhook event...")
     
-    # Validate payload structure
+    # HubSpot can send either a single event (dict) or an array of events
+    # Handle array case first
+    if isinstance(event, list):
+        print(f"   📦 Received array of {len(event)} event(s), processing each...")
+        results = []
+        for idx, single_event in enumerate(event):
+            print(f"\n   🔄 Processing event {idx + 1}/{len(event)}...")
+            if isinstance(single_event, dict):
+                result = handle_single_hubspot_event(single_event)
+                results.append(result)
+            else:
+                print(f"   ⚠️  Event {idx + 1} is not a dictionary, skipping")
+        
+        # Return summary
+        success_count = sum(1 for r in results if r.get("status") == "success")
+        ignored_count = sum(1 for r in results if r.get("status") == "ignored")
+        error_count = sum(1 for r in results if r.get("status") == "error")
+        
+        return {
+            "status": "success" if success_count > 0 else ("ignored" if error_count == 0 else "error"),
+            "message": f"Processed {len(event)} event(s): {success_count} succeeded, {ignored_count} ignored, {error_count} errors",
+            "results": results
+        }
+    
+    # Validate payload structure for single event
     if not isinstance(event, dict):
-        print(f"   ❌ Invalid payload: not a dictionary")
+        print(f"   ❌ Invalid payload: not a dictionary or array")
         return {
             "status": "error",
             "message": "Invalid webhook payload format"
         }
+    
+    # Process single event
+    return handle_single_hubspot_event(event)
+
+
+def handle_single_hubspot_event(event: Dict) -> Dict:
     
     # Log full event structure for debugging
     print(f"   📄 Event keys: {list(event.keys())}")
@@ -244,9 +321,28 @@ def handle_hubspot_user_webhook(event: Dict) -> Dict:
     user_id = None
     user_data = None
     
-    # Format 0: Contact-specific webhook format - CHECK THIS FIRST (primary use case)
-    # Contact webhooks: contact.created, contact.updated, contact.propertyChange
-    if event.get("eventType", "").lower().startswith("contact.") or "contactId" in event:
+    # Format 0: Expanded object format with propertyChange - CHECK THIS FIRST
+    # HubSpot expanded object format sends: subscriptionType, objectId, propertyName, propertyValue
+    subscription_type = event.get("subscriptionType", "").lower()
+    if subscription_type == "object.propertychange" and "objectId" in event:
+        object_id = str(event.get("objectId"))
+        property_name = event.get("propertyName", "").lower()
+        
+        # Only process firstname/lastname property changes
+        if property_name in ["firstname", "lastname", "first name", "last name"]:
+            user_id = object_id
+            property_value = event.get("propertyValue", "")
+            # Store the property name and value
+            user_data = {
+                "propertyName": property_name,
+                "propertyValue": property_value,
+                "objectTypeId": event.get("objectTypeId", ""),  # "0-1" = Contact
+                "subscriptionType": subscription_type
+            }
+            print(f"   📦 Found expanded object propertyChange: {user_id} ({property_name}={property_value})")
+    
+    # Format 1: Contact-specific webhook format (contact.created, contact.updated, etc.)
+    elif event.get("eventType", "").lower().startswith("contact.") or "contactId" in event:
         contact_id = event.get("contactId") or event.get("objectId")
         if contact_id:
             user_id = str(contact_id)
@@ -257,7 +353,7 @@ def handle_hubspot_user_webhook(event: Dict) -> Dict:
                 for key in ["firstname", "lastname", "email"]:
                     if key in event:
                         user_data[key] = event[key]
-            print(f"   📦 Found Contact webhook format (PRIMARY): {user_id}")
+            print(f"   📦 Found Contact webhook format: {user_id}")
     
     # Format 1: Expanded object support format (generic object model)
     # Expanded format has: subscriptionId, occurredAt, objectId, eventType (object.creation, object.propertyChange, etc.)
@@ -341,18 +437,36 @@ def handle_hubspot_user_webhook(event: Dict) -> Dict:
                 print(f"   📦 Found nested object format: {user_id} (type: {obj_type})")
     
     
+    # If we found a propertyChange event, check if we should process it
+    # Only process firstname/lastname changes - other properties are ignored
+    if user_id and user_data and user_data.get("subscriptionType") == "object.propertychange":
+        property_name = user_data.get("propertyName", "").lower()
+        if property_name not in ["firstname", "lastname", "first name", "last name"]:
+            print(f"   ⏭️  Property '{property_name}' is not firstname/lastname, ignoring")
+            return {
+                "status": "ignored",
+                "message": f"Property '{property_name}' does not require name normalization"
+            }
+    
     if not user_id:
-        print(f"   ⏭️  No user ID found in webhook event (may not be a user event)")
+        print(f"   ⏭️  No user ID found in webhook event (may not be a name-related event)")
         print(f"   📄 Event keys: {list(event.keys())}")
         return {
             "status": "ignored",
             "message": "No user ID found in webhook event"
         }
     
-    print(f"   🆔 User ID: {user_id}")
+    print(f"   🆔 Contact/User ID: {user_id}")
     
-    # Get current user data from HubSpot API (more reliable than webhook payload)
-    user = get_hubspot_user(user_id)
+    # Check objectTypeId to determine if it's a Contact
+    # "0-1" = Contact, need to use Contacts API
+    object_type_id = user_data.get("objectTypeId", "") if user_data else event.get("objectTypeId", "")
+    is_contact = (object_type_id == "0-1" or 
+                  event.get("objectTypeId", "") == "0-1" or
+                  "contact" in str(event.get("objectType", "")).lower())
+    
+    # Get current user/contact data from HubSpot API (more reliable than webhook payload)
+    user = get_hubspot_user(user_id, is_contact=is_contact)
     if not user:
         print(f"   ❌ Could not retrieve user from HubSpot")
         return {
@@ -439,9 +553,9 @@ def handle_hubspot_user_webhook(event: Dict) -> Dict:
             "message": "Names already normalized"
         }
     
-    # Update user in HubSpot
-    print(f"   🔄 Updating user names in HubSpot...")
-    success = update_hubspot_user_name(user_id, normalized_first, normalized_last)
+    # Update user/contact in HubSpot
+    print(f"   🔄 Updating names in HubSpot...")
+    success = update_hubspot_user_name(user_id, normalized_first, normalized_last, is_contact=is_contact)
     
     if success:
         print(f"   ✅ Successfully normalized user name")
