@@ -52,20 +52,30 @@ def handle_notion_webhook(event: Dict) -> Dict:
     Handle a webhook event from Notion
     Returns a response dict with status
     """
+    print(f"   🔍 Processing webhook event...")
+    
     event_type = event.get("type")
+    print(f"   📋 Event type: {event_type}")
+    
     event_data = event.get("data", {})
     
     # Get the page object
     page_obj = event_data.get("object", {})
+    print(f"   📄 Page object type: {page_obj.get('object')}")
     
     if event_type not in ["page.created", "page.updated"]:
+        print(f"   ⏭️  Ignoring event type: {event_type}")
         return {
             "status": "ignored",
             "message": f"Event type {event_type} not handled"
         }
     
     # Check if it's a user page
-    if not is_user_page(event):
+    is_user = is_user_page(event)
+    print(f"   👤 Is user page: {is_user}")
+    
+    if not is_user:
+        print(f"   ⏭️  Not a user page, ignoring")
         return {
             "status": "ignored",
             "message": "Not a user page"
@@ -74,27 +84,34 @@ def handle_notion_webhook(event: Dict) -> Dict:
     # Get the page ID
     page_id = page_obj.get("id")
     if not page_id:
+        print(f"   ❌ No page ID found")
         return {
             "status": "error",
             "message": "No page ID found in event"
         }
     
+    print(f"   🆔 Page ID: {page_id}")
+    print(f"   🔄 Starting sync to HubSpot...")
+    
     # Sync to HubSpot
     try:
         success = sync_user_to_hubspot(page_id)
         if success:
+            print(f"   ✅ Successfully synced to HubSpot")
             return {
                 "status": "success",
                 "message": f"User {page_id} synced to HubSpot",
                 "page_id": page_id
             }
         else:
+            print(f"   ❌ Failed to sync to HubSpot")
             return {
                 "status": "error",
                 "message": f"Failed to sync user {page_id}",
                 "page_id": page_id
             }
     except Exception as e:
+        print(f"   ❌ Exception: {str(e)}")
         return {
             "status": "error",
             "message": f"Exception syncing user: {str(e)}",
