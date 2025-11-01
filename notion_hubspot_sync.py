@@ -50,10 +50,33 @@ def get_notion_user(user_page_id: str) -> Optional[Dict]:
         return None
 
 
+def capitalize_name(name: str) -> str:
+    """
+    Capitalize the first letter of a name
+    
+    Examples:
+        "john" → "John"
+        "mary jane" → "Mary jane"
+        "O'CONNOR" → "O'connor"
+        "" → ""
+    """
+    if not name or not name.strip():
+        return name
+    
+    # Trim whitespace
+    name = name.strip()
+    
+    # Capitalize first letter, keep rest as-is
+    if len(name) > 0:
+        return name[0].upper() + name[1:] if len(name) > 1 else name[0].upper()
+    
+    return name
+
+
 def extract_user_properties(notion_user: Dict) -> Dict:
     """
     Extract user properties from Notion page
-    Returns a dictionary with HubSpot-ready fields
+    Returns a dictionary with HubSpot-ready fields (names normalized)
     """
     properties = notion_user.get("properties", {})
     
@@ -76,6 +99,10 @@ def extract_user_properties(notion_user: Dict) -> Dict:
     last_name_prop = properties.get("✅ Last Name", {})
     if last_name_prop.get("rich_text") and len(last_name_prop["rich_text"]) > 0:
         last_name = last_name_prop["rich_text"][0].get("text", {}).get("content", "")
+    
+    # Normalize names (capitalize first letter)
+    first_name = capitalize_name(first_name)
+    last_name = capitalize_name(last_name)
     
     # Extract HubSpot Role from rollup
     hubspot_role = ""
