@@ -1,6 +1,11 @@
 """
 HubSpot Webhook Handler
-Handles webhook events from HubSpot to normalize user names (capitalize first letters)
+Handles webhook events from HubSpot to normalize contact/user names (capitalize first letters)
+
+Primary use: Contact webhooks - when first name or last name is added/updated on a Contact
+Supports:
+- HubSpot Contacts (CRM) - PRIMARY TARGET - contact.created, contact.propertyChange
+- HubSpot Users (Settings API) - internal team members (secondary support)
 """
 
 import requests
@@ -65,23 +70,40 @@ def get_hubspot_user(user_id: str) -> Optional[Dict]:
         print("  ✗ Error: HUBSPOT_ACCESS_TOKEN not set")
         return None
     
+    # Try Users API first (Settings API)
     url = f"{HUBSPOT_BASE_URL}/settings/v3/users/{user_id}"
     response = requests.get(url, headers=HUBSPOT_HEADERS)
     
     if response.status_code == 200:
         return response.json()
-    else:
-        print(f"  ✗ Error getting HubSpot user: {response.status_code}")
-        print(f"    Response: {response.text}")
-        return None
+    elif response.status_code == 404:
+        # If not found as User, might be a Contact - try Contacts API
+        print(f"  ⚠️  User {user_id} not found in Users API, trying Contacts API...")
+        contact_url = f"{HUBSPOT_BASE_URL}/crm/v3/objects/contacts/{user_id}"
+        contact_response = requests.get(contact_url, headers=HUBSPOT_HEADERS)
+        if contact_response.status_code == 200:
+            contact_data = contact_response.json()
+            # Convert contact format to user-like format
+            props = contact_data.get("properties", {})
+            return {
+                "id": contact_data.get("id"),
+                "firstName": props.get("firstname", ""),
+                "lastName": props.get("lastname", ""),
+                "email": props.get("email", "")
+            }
+    
+    print(f"  ✗ Error getting HubSpot user: {response.status_code}")
+    print(f"    Response: {response.text}")
+    return None
 
 
 def update_hubspot_user_name(user_id: str, first_name: str, last_name: str) -> bool:
     """
     Update a user's first and last name in HubSpot
+    Tries Users API first, falls back to Contacts API if needed
     
     Args:
-        user_id: HubSpot user ID
+        user_id: HubSpot user ID or Contact ID
         first_name: New first name
         last_name: New last name
     
@@ -92,6 +114,7 @@ def update_hubspot_user_name(user_id: str, first_name: str, last_name: str) -> b
         print("  ✗ Error: HUBSPOT_ACCESS_TOKEN not set")
         return False
     
+    # Try Users API first (Settings API)
     url = f"{HUBSPOT_BASE_URL}/settings/v3/users/{user_id}"
     
     payload = {}
@@ -104,13 +127,32 @@ def update_hubspot_user_name(user_id: str, first_name: str, last_name: str) -> b
         print("  ℹ️  No names to update")
         return True
     
+    # Try PATCH first, then PUT if needed
     response = requests.patch(url, headers=HUBSPOT_HEADERS, json=payload)
     
+    if response.status_code == 405:
+        # Try PUT method
+        response = requests.put(url, headers=HUBSPOT_HEADERS, json=payload)
+    
+    if response.status_code == 404:
+        # Not a User, try as Contact
+        print(f"  ⚠️  User {user_id} not found, trying as Contact...")
+        contact_url = f"{HUBSPOT_BASE_URL}/crm/v3/objects/contacts/{user_id}"
+        contact_payload = {
+            "properties": {}
+        }
+        if first_name:
+            contact_payload["properties"]["firstname"] = first_name
+        if last_name:
+            contact_payload["properties"]["lastname"] = last_name
+        
+        response = requests.patch(contact_url, headers=HUBSPOT_HEADERS, json=contact_payload)
+    
     if response.status_code == 200:
-        print(f"  ✅ Updated user name: {first_name} {last_name}")
+        print(f"  ✅ Updated name: {first_name} {last_name}")
         return True
     else:
-        print(f"  ✗ Error updating user: {response.status_code}")
+        print(f"  ✗ Error updating: {response.status_code}")
         print(f"    Response: {response.text}")
         return False
 
@@ -202,21 +244,40 @@ def handle_hubspot_user_webhook(event: Dict) -> Dict:
     user_id = None
     user_data = None
     
-    # Format 1: Expanded object support format (generic object model) - CHECK THIS FIRST
+    # Format 0: Contact-specific webhook format - CHECK THIS FIRST (primary use case)
+    # Contact webhooks: contact.created, contact.updated, contact.propertyChange
+    if event.get("eventType", "").lower().startswith("contact.") or "contactId" in event:
+        contact_id = event.get("contactId") or event.get("objectId")
+        if contact_id:
+            user_id = str(contact_id)
+            # Contact properties use lowercase: firstname, lastname
+            user_data = event.get("properties", {})
+            if not user_data:
+                user_data = {}
+                for key in ["firstname", "lastname", "email"]:
+                    if key in event:
+                        user_data[key] = event[key]
+            print(f"   📦 Found Contact webhook format (PRIMARY): {user_id}")
+    
+    # Format 1: Expanded object support format (generic object model)
     # Expanded format has: subscriptionId, occurredAt, objectId, eventType (object.creation, object.propertyChange, etc.)
-    if "occurredAt" in event or "subscriptionId" in event:
+    elif "occurredAt" in event or "subscriptionId" in event:
         # Expanded object format structure
         if "objectId" in event:
             object_id = str(event.get("objectId"))
             object_type = event.get("objectType", "").upper()
             expanded_event_type = event.get("eventType", "").lower()
             
-            # Check if it's a user-related object
+            # Check if it's a user-related object or contact
             # Support: object.creation, object.propertyChange, object.deletion
+            # Also support contacts: contact.created, contact.propertyChange, etc.
             is_user_event = (
                 "USER" in object_type or 
+                "CONTACT" in object_type or
                 expanded_event_type.startswith("object.") or
-                expanded_event_type in ["user.created", "user.updated", "user.propertychange", "user.deleted"]
+                expanded_event_type.startswith("contact.") or
+                expanded_event_type in ["user.created", "user.updated", "user.propertychange", "user.deleted",
+                                       "contact.created", "contact.updated", "contact.propertychange"]
             )
             
             if is_user_event:
@@ -261,10 +322,11 @@ def handle_hubspot_user_webhook(event: Dict) -> Dict:
     
     # Format 5: HubSpot contact/object webhook with associations
     elif not user_id and "objectType" in event:
-        if event.get("objectType") == "USER" or event.get("objectType") == "USER_DEFINED":
+        object_type_val = event.get("objectType", "").upper()
+        if object_type_val in ["USER", "USER_DEFINED", "CONTACT"]:
             user_id = str(event.get("objectId", ""))
             user_data = event.get("properties", {})
-            print(f"   📦 Found objectType format: {user_id}")
+            print(f"   📦 Found objectType format: {user_id} (type: {object_type_val})")
     
     # Format 6: Nested object structure (expanded format variant)
     if not user_id and "object" in event:
@@ -272,10 +334,12 @@ def handle_hubspot_user_webhook(event: Dict) -> Dict:
         if isinstance(obj, dict):
             obj_id = obj.get("id") or obj.get("objectId")
             obj_type = obj.get("type") or obj.get("objectType", "")
-            if obj_id and ("USER" in str(obj_type).upper() or "firstName" in obj or "email" in obj):
+            # Support both Users and Contacts
+            if obj_id and ("USER" in str(obj_type).upper() or "CONTACT" in str(obj_type).upper() or "firstName" in obj or "firstname" in obj or "email" in obj):
                 user_id = str(obj_id)
                 user_data = obj.get("properties", {}) or obj
-                print(f"   📦 Found nested object format: {user_id}")
+                print(f"   📦 Found nested object format: {user_id} (type: {obj_type})")
+    
     
     if not user_id:
         print(f"   ⏭️  No user ID found in webhook event (may not be a user event)")
@@ -297,27 +361,58 @@ def handle_hubspot_user_webhook(event: Dict) -> Dict:
         }
     
     # Extract current names from API response (most reliable)
-    current_first = user.get("firstName", "") or ""
-    current_last = user.get("lastName", "") or ""
+    # Handle both User format (firstName/lastName) and Contact format (firstname/lastname)
+    current_first = user.get("firstName", "") or user.get("firstname", "") or ""
+    current_last = user.get("lastName", "") or user.get("lastname", "") or ""
     
     # If names are empty, try from webhook payload
     # Handle both standard format and expanded object format (propertyName/propertyValue)
     if user_data:
-        # Standard property format
+        # Standard property format (check both camelCase and lowercase)
         if not current_first:
-            current_first = user_data.get("firstName", "") or user_data.get("firstname", "") or ""
+            current_first = (
+                user_data.get("firstName", "") or 
+                user_data.get("firstname", "") or
+                user_data.get("First Name", "") or
+                ""
+            )
         if not current_last:
-            current_last = user_data.get("lastName", "") or user_data.get("lastname", "") or ""
+            current_last = (
+                user_data.get("lastName", "") or 
+                user_data.get("lastname", "") or
+                user_data.get("Last Name", "") or
+                ""
+            )
         
-        # Expanded format: propertyName might be "firstName" and propertyValue contains the value
+        # Expanded format: propertyName might be "firstName" or "firstname" and propertyValue contains the value
         # Also check if propertyName indicates which field changed
-        property_name = user_data.get("propertyName", "").lower()
+        property_name = (user_data.get("propertyName", "") or "").lower()
         property_value = user_data.get("propertyValue", "")
         
-        if property_name == "firstname" and property_value:
+        if property_name in ["firstname", "first name"] and property_value:
             current_first = str(property_value)
-        elif property_name == "lastname" and property_value:
+        elif property_name in ["lastname", "last name"] and property_value:
             current_last = str(property_value)
+    
+    # Also check event directly for Contact-specific fields
+    if not current_first or not current_last:
+        # Check event payload directly for Contact properties
+        event_props = event.get("properties", {})
+        if isinstance(event_props, dict):
+            if not current_first:
+                current_first = (
+                    event_props.get("firstname", "") or 
+                    event_props.get("firstName", "") or
+                    event_props.get("First Name", "") or
+                    ""
+                )
+            if not current_last:
+                current_last = (
+                    event_props.get("lastname", "") or 
+                    event_props.get("lastName", "") or
+                    event_props.get("Last Name", "") or
+                    ""
+                )
     
     print(f"   📝 Current names: '{current_first}' '{current_last}'")
     

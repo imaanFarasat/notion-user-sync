@@ -250,7 +250,14 @@ def update_user_in_hubspot(user_data: Dict, hubspot_user_id: str) -> bool:
         print("  ℹ️  No fields to update")
         return True
     
+    # HubSpot Settings Users API might require PUT instead of PATCH
+    # Try PATCH first, fallback to PUT if 405
     response = requests.patch(url, headers=HUBSPOT_HEADERS, json=payload)
+    
+    if response.status_code == 405:
+        # Try PUT method instead
+        print(f"  ⚠️  PATCH not allowed, trying PUT...")
+        response = requests.put(url, headers=HUBSPOT_HEADERS, json=payload)
     
     if response.status_code == 200:
         print(f"✅ Updated user in HubSpot: {user_data.get('email', hubspot_user_id)}")
@@ -258,6 +265,8 @@ def update_user_in_hubspot(user_data: Dict, hubspot_user_id: str) -> bool:
     else:
         print(f"✗ Error updating user in HubSpot: {response.status_code}")
         print(f"  Response: {response.text}")
+        print(f"  URL: {url}")
+        print(f"  Payload: {payload}")
         return False
 
 
