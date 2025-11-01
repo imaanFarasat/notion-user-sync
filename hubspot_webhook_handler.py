@@ -115,6 +115,44 @@ def update_hubspot_user_name(user_id: str, first_name: str, last_name: str) -> b
         return False
 
 
+def validate_expanded_object_payload(event: Dict) -> bool:
+    """
+    Validate that the webhook payload matches expanded object support format
+    
+    Expected format:
+    {
+        "subscriptionId": "...",
+        "portalId": 12345,
+        "occurredAt": timestamp,
+        "objectId": "123",
+        "objectType": "USER" or similar,
+        "eventType": "object.creation" | "object.propertyChange" | "object.deletion",
+        "propertyName": "firstName" (for propertyChange),
+        "propertyValue": "john" (for propertyChange),
+        "properties": {...} (optional)
+    }
+    
+    Returns True if payload structure looks valid
+    """
+    # Check for expanded object format markers
+    has_subscription_id = "subscriptionId" in event
+    has_object_id = "objectId" in event
+    has_event_type = "eventType" in event
+    
+    # At minimum, we need objectId to process
+    if not has_object_id:
+        return False
+    
+    # Expanded format should have subscriptionId and eventType
+    if has_subscription_id and has_event_type:
+        event_type = event.get("eventType", "").lower()
+        # Should start with "object." for expanded format
+        if event_type.startswith("object."):
+            return True
+    
+    return True  # Don't reject if format is slightly different, be flexible
+
+
 def handle_hubspot_user_webhook(event: Dict) -> Dict:
     """
     Handle a webhook event from HubSpot
@@ -132,41 +170,112 @@ def handle_hubspot_user_webhook(event: Dict) -> Dict:
     """
     print(f"   🔍 Processing HubSpot webhook event...")
     
+    # Validate payload structure
+    if not isinstance(event, dict):
+        print(f"   ❌ Invalid payload: not a dictionary")
+        return {
+            "status": "error",
+            "message": "Invalid webhook payload format"
+        }
+    
+    # Log full event structure for debugging
+    print(f"   📄 Event keys: {list(event.keys())}")
+    
+    # Validate expanded object format if applicable
+    is_expanded_format = validate_expanded_object_payload(event)
+    if is_expanded_format and ("subscriptionId" in event or "occurredAt" in event):
+        print(f"   ✅ Detected expanded object support format")
+    
     # HubSpot webhook structure varies, check common formats
-    event_type = event.get("eventType") or event.get("subscriptionType") or event.get("type")
+    # Expanded object support uses standardized format with object.* event types
+    event_type = (
+        event.get("eventType") or 
+        event.get("subscriptionType") or 
+        event.get("type") or
+        event.get("event") or
+        event.get("event_id")
+    )
     print(f"   📋 Event type: {event_type}")
     
     # Extract user information from different webhook formats
+    # PRIORITY: Check expanded object support format FIRST (most common with enabled feature)
     user_id = None
     user_data = None
     
-    # Format 1: Standard HubSpot subscription webhook (subscriptionId, portalId, eventType, objectId)
-    if "objectId" in event:
+    # Format 1: Expanded object support format (generic object model) - CHECK THIS FIRST
+    # Expanded format has: subscriptionId, occurredAt, objectId, eventType (object.creation, object.propertyChange, etc.)
+    if "occurredAt" in event or "subscriptionId" in event:
+        # Expanded object format structure
+        if "objectId" in event:
+            object_id = str(event.get("objectId"))
+            object_type = event.get("objectType", "").upper()
+            expanded_event_type = event.get("eventType", "").lower()
+            
+            # Check if it's a user-related object
+            # Support: object.creation, object.propertyChange, object.deletion
+            is_user_event = (
+                "USER" in object_type or 
+                expanded_event_type.startswith("object.") or
+                expanded_event_type in ["user.created", "user.updated", "user.propertychange", "user.deleted"]
+            )
+            
+            if is_user_event:
+                user_id = object_id
+                # For propertyChange events, properties are in propertyName/propertyValue
+                # For creation/update, properties might be in a separate object
+                user_data = {}
+                
+                # Handle property change events
+                if "propertyChange" in expanded_event_type or "propertychange" in expanded_event_type:
+                    property_name = event.get("propertyName", "")
+                    property_value = event.get("propertyValue", "")
+                    if property_name:
+                        user_data[property_name] = property_value
+                
+                # Also check for properties object
+                if event.get("properties"):
+                    user_data.update(event.get("properties", {}))
+                
+                print(f"   📦 Found expanded object format: {user_id} (type: {object_type}, event: {expanded_event_type})")
+    
+    # Format 2: Standard HubSpot subscription webhook (subscriptionId, portalId, eventType, objectId)
+    if not user_id and "objectId" in event:
         user_id = str(event.get("objectId"))
         # Properties might be in event or need to fetch from API
         user_data = event.get("properties", {})
-        print(f"   📦 Found objectId format: {user_id}")
+        print(f"   📦 Found standard objectId format: {user_id}")
     
-    # Format 2: user.create or user.propertyChange (userId directly)
-    elif "userId" in event:
+    # Format 3: user.create or user.propertyChange (userId directly)
+    elif not user_id and "userId" in event:
         user_id = str(event.get("userId"))
         user_data = event.get("properties", {})
         print(f"   📦 Found userId format: {user_id}")
     
-    # Format 3: Full user object in response
-    elif "id" in event:
+    # Format 4: Full user object in response
+    elif not user_id and "id" in event:
         # Check if this looks like a user object
         if event.get("type") == "USER" or "email" in event or "firstName" in event:
             user_id = str(event.get("id"))
             user_data = event
             print(f"   📦 Found user object format: {user_id}")
     
-    # Format 4: HubSpot contact/object webhook with associations
-    elif "objectType" in event:
+    # Format 5: HubSpot contact/object webhook with associations
+    elif not user_id and "objectType" in event:
         if event.get("objectType") == "USER" or event.get("objectType") == "USER_DEFINED":
             user_id = str(event.get("objectId", ""))
             user_data = event.get("properties", {})
             print(f"   📦 Found objectType format: {user_id}")
+    
+    # Format 6: Nested object structure (expanded format variant)
+    if not user_id and "object" in event:
+        obj = event.get("object", {})
+        if isinstance(obj, dict):
+            obj_id = obj.get("id") or obj.get("objectId")
+            obj_type = obj.get("type") or obj.get("objectType", "")
+            if obj_id and ("USER" in str(obj_type).upper() or "firstName" in obj or "email" in obj):
+                user_id = str(obj_id)
+                user_data = obj.get("properties", {}) or obj
+                print(f"   📦 Found nested object format: {user_id}")
     
     if not user_id:
         print(f"   ⏭️  No user ID found in webhook event (may not be a user event)")
@@ -192,10 +301,23 @@ def handle_hubspot_user_webhook(event: Dict) -> Dict:
     current_last = user.get("lastName", "") or ""
     
     # If names are empty, try from webhook payload
-    if not current_first and user_data:
-        current_first = user_data.get("firstName", "") or ""
-    if not current_last and user_data:
-        current_last = user_data.get("lastName", "") or ""
+    # Handle both standard format and expanded object format (propertyName/propertyValue)
+    if user_data:
+        # Standard property format
+        if not current_first:
+            current_first = user_data.get("firstName", "") or user_data.get("firstname", "") or ""
+        if not current_last:
+            current_last = user_data.get("lastName", "") or user_data.get("lastname", "") or ""
+        
+        # Expanded format: propertyName might be "firstName" and propertyValue contains the value
+        # Also check if propertyName indicates which field changed
+        property_name = user_data.get("propertyName", "").lower()
+        property_value = user_data.get("propertyValue", "")
+        
+        if property_name == "firstname" and property_value:
+            current_first = str(property_value)
+        elif property_name == "lastname" and property_value:
+            current_last = str(property_value)
     
     print(f"   📝 Current names: '{current_first}' '{current_last}'")
     
