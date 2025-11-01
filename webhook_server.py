@@ -55,13 +55,33 @@ def notion_webhook():
                 "message": "No event data received"
             }), 400
         
+        # Log the incoming request for debugging
+        print(f"\n📨 Received webhook request:")
+        print(f"   Method: {request.method}")
+        print(f"   Headers: {dict(request.headers)}")
+        print(f"   Data: {event}")
+        
         # Check if this is a verification challenge
-        # Notion sometimes sends a challenge in the event
+        # Notion sends verification tokens in different formats:
+        # 1. As "challenge" field - echo it back
+        # 2. As "token" field - return it
+        # 3. In request body - return the whole response
+        
         if isinstance(event, dict):
-            challenge = event.get("challenge")
+            # Check for challenge token
+            challenge = event.get("challenge") or event.get("token") or event.get("verification_token")
             if challenge:
                 # Echo back the challenge for verification
+                print(f"   ✅ Verification token received: {challenge}")
                 return jsonify({"challenge": challenge}), 200
+            
+            # Check if it's a verification request
+            if event.get("type") == "verification" or "verify" in str(event).lower():
+                # Return the token if present
+                token = event.get("token") or event.get("challenge")
+                if token:
+                    print(f"   ✅ Verification token: {token}")
+                    return jsonify({"token": token, "challenge": token}), 200
         
         # Handle the webhook event
         result = handle_notion_webhook(event)
@@ -75,6 +95,7 @@ def notion_webhook():
             return jsonify(result), 500
             
     except Exception as e:
+        print(f"   ❌ Error: {str(e)}")
         return jsonify({
             "status": "error",
             "message": f"Exception handling webhook: {str(e)}"
