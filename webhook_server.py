@@ -28,11 +28,23 @@ def health_check():
         "service": "Notion to HubSpot User Sync Webhook"
     }), 200
 
-@app.route('/notion-webhook', methods=['POST'])
+@app.route('/notion-webhook', methods=['GET', 'POST'])
 def notion_webhook():
     """
     Main webhook endpoint for Notion events
+    Handles both GET (verification) and POST (events)
     """
+    # Handle GET request (webhook verification)
+    if request.method == 'GET':
+        # Notion may send a verification request
+        # Return 200 to confirm endpoint is working
+        return jsonify({
+            "status": "ready",
+            "message": "Webhook endpoint is ready to receive events",
+            "endpoint": "/notion-webhook"
+        }), 200
+    
+    # Handle POST request (webhook events)
     try:
         # Get the webhook event
         event = request.json
@@ -42,6 +54,14 @@ def notion_webhook():
                 "status": "error",
                 "message": "No event data received"
             }), 400
+        
+        # Check if this is a verification challenge
+        # Notion sometimes sends a challenge in the event
+        if isinstance(event, dict):
+            challenge = event.get("challenge")
+            if challenge:
+                # Echo back the challenge for verification
+                return jsonify({"challenge": challenge}), 200
         
         # Handle the webhook event
         result = handle_notion_webhook(event)
